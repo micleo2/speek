@@ -80,6 +80,7 @@ a.entry { text-decoration: none; color: inherit; }
 .entry:nth-child(odd) { background: rgba(255,255,255,0.02); }
 .entry:nth-child(even) { background: rgba(255,255,255,0.05); }
 .entry:hover { background: var(--hover); }
+.entry.selected { background: rgba(255,255,255,0.18); outline: 1px solid rgba(255,255,255,0.25); outline-offset: -1px; }
 .entry .icon { width: 20px; text-align: center; flex-shrink: 0; }
 .entry .name { flex: 1; }
 .entry .badge {
@@ -198,6 +199,7 @@ a.folder-item {
     color: inherit;
 }
 a.folder-item:hover { background: var(--hover); }
+a.folder-item.selected { background: rgba(255,255,255,0.18); outline: 1px solid rgba(255,255,255,0.25); outline-offset: -1px; }
 .folder-item .folder-label { font-size: 14px; color: var(--fg); }
 .folder-item .folder-path { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
 """
@@ -352,7 +354,93 @@ function closeModals() {
     document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
 }
 
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModals(); });
+function kbSelect(el) {
+    ctxEntry = {
+        path: el.dataset.path,
+        isDir: el.dataset.dir === 'true',
+        state: el.dataset.state,
+        name: el.dataset.name
+    };
+}
+
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { closeModals(); hideCtx(); return; }
+
+    // Modal keyboard shortcuts
+    const confirmModal = document.getElementById('confirm-modal');
+    if (confirmModal.classList.contains('active')) {
+        if (e.key === 'Enter' || e.key === 'y') {
+            e.preventDefault();
+            document.getElementById('confirm-btn').click();
+        }
+        return;
+    }
+    const renameModal = document.getElementById('rename-modal');
+    if (renameModal.classList.contains('active')) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            document.getElementById('rename-btn').click();
+        }
+        return;
+    }
+
+    // h always works (even in empty directories)
+    if (e.key === 'h') {
+        const bc = document.querySelectorAll('#breadcrumb a:not(.current)');
+        if (bc.length) {
+            e.preventDefault();
+            location.href = bc[bc.length - 1].href;
+        }
+        return;
+    }
+
+    // Navigation — works on both .entry (listing) and .folder-item (picker)
+    const items = Array.from(document.querySelectorAll('.entry, .folder-item'));
+    if (!items.length) return;
+    const cur = document.querySelector('.entry.selected, .folder-item.selected');
+    let idx = cur ? items.indexOf(cur) : -1;
+    if (e.key === 'j') {
+        e.preventDefault();
+        idx = Math.min(idx + 1, items.length - 1);
+        if (cur) cur.classList.remove('selected');
+        items[idx].classList.add('selected');
+        items[idx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'k') {
+        e.preventDefault();
+        idx = Math.max(idx <= 0 ? 0 : idx - 1, 0);
+        if (cur) cur.classList.remove('selected');
+        items[idx].classList.add('selected');
+        items[idx].scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'l' || e.key === 'Enter') {
+        if (cur && cur.href) {
+            e.preventDefault();
+            location.href = cur.href;
+        }
+    } else if (e.key === 's') {
+        if (!cur) return;
+        const s = cur.dataset.state;
+        if (s === 'remote' || s === 'local') {
+            e.preventDefault();
+            kbSelect(cur);
+            doSync();
+        }
+    } else if (e.key === 'x') {
+        if (!cur) return;
+        const s = cur.dataset.state;
+        if (s === 'synced' || s === 'syncing' || s === 'stale') {
+            e.preventDefault();
+            kbSelect(cur);
+            doUnsync();
+        }
+    } else if (e.key === 'r') {
+        if (!cur) return;
+        if (cur.dataset.state === 'synced' && cur.dataset.dir === 'true') {
+            e.preventDefault();
+            kbSelect(cur);
+            doRename();
+        }
+    }
+});
 
 if (typeof FOLDER !== 'undefined') startSyncPoll();
 """
@@ -481,6 +569,7 @@ class StignoreManager:
         self.syncthing = syncthing
         self.folder_id = folder_id
         self.local_path = pathlib.Path(local_path).expanduser()
+        self._cached_parse = None
         self._ensure_initialized()
 
     def _ensure_initialized(self):
@@ -490,7 +579,12 @@ class StignoreManager:
             self.syncthing.set_ignores(self.folder_id, self.DEFAULT_LINES)
 
     def _parse(self):
-        """Parse .stignore into (preamble_lines, whitelist_set, catchall_lines)."""
+        """Parse .stignore into (preamble_lines, whitelist_set, catchall_lines).
+
+        Result is cached until invalidated by _write().
+        """
+        if self._cached_parse is not None:
+            return self._cached_parse
         lines = self.syncthing.get_ignores(self.folder_id)
 
         preamble = []
@@ -524,10 +618,12 @@ class StignoreManager:
             preamble.append(self.HEADER_MARKER)
             catchall = ["*"]
 
+        self._cached_parse = (preamble, whitelist, catchall)
         return preamble, whitelist, catchall
 
     def _write(self, preamble, whitelist, catchall):
         """Write .stignore via Syncthing API."""
+        self._cached_parse = None
         lines = list(preamble)
         for path in sorted(whitelist):
             lines.append("!/" + path)
@@ -570,7 +666,9 @@ class StignoreManager:
         self._write(preamble, whitelist, catchall)
         # Delete local copy
         local = self.local_path / path
-        if local.is_dir():
+        if local.is_symlink():
+            local.unlink()
+        elif local.is_dir():
             shutil.rmtree(str(local))
         elif local.exists():
             local.unlink()
@@ -637,7 +735,7 @@ class SyncthingClient:
     def get_ignores(self, folder_id: str) -> list:
         """Return the raw .stignore lines for a folder."""
         data = self._request("GET", "/rest/db/ignores?folder=" + urllib.parse.quote(folder_id))
-        return data.get("ignore", []) if data else []
+        return (data.get("ignore") or []) if data else []
 
     def set_ignores(self, folder_id: str, lines: list):
         """Replace .stignore content for a folder."""
@@ -663,7 +761,11 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
     syncthing: SyncthingClient  # set once by main()
 
     def log_message(self, format, *args):
-        pass
+        pass  # suppress per-request logging
+
+    def log_error(self, format, *args):
+        import sys
+        sys.stderr.write(f"{format % args}\n")
 
     def _send_json(self, data, code=200):
         body = json.dumps(data).encode()
@@ -701,7 +803,7 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         normalized = os.path.normpath(path)
         if normalized.startswith("..") or os.path.isabs(normalized):
             raise ValueError("Invalid path")
-        for part in normalized.split(os.sep):
+        for part in normalized.split("/"):
             if part == "..":
                 raise ValueError("Invalid path")
         return normalized
@@ -802,7 +904,7 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                 })
 
         # Detect stale whitelist entries
-        for w in stignore.get_whitelist():
+        for w in whitelist:
             if rel:
                 if not w.startswith(rel + "/"):
                     continue
@@ -814,7 +916,7 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                 seen.add(name)
                 item_rel = (rel + "/" + name) if rel else name
                 is_dir = "/" in remainder or any(
-                    w2.startswith(item_rel + "/") for w2 in stignore.get_whitelist()
+                    w2.startswith(item_rel + "/") for w2 in whitelist
                 )
                 entries.append({
                     "name": name,
@@ -838,6 +940,11 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         if path == "/":
             folders = self.syncthing.get_folders()
             self._send_html(_render_page("peek", _render_picker(folders)))
+            return
+
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
             return
 
         if path.startswith("/api/"):
@@ -1017,7 +1124,7 @@ def main():
 
     NasUIHandler.syncthing = syncthing
 
-    server = http.server.HTTPServer((args.bind, args.port), NasUIHandler)
+    server = http.server.ThreadingHTTPServer((args.bind, args.port), NasUIHandler)
     print(f"peek \u2192 http://{args.bind}:{args.port}")
     try:
         server.serve_forever()
