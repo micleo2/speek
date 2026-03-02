@@ -10,18 +10,14 @@ import os
 import urllib.parse
 import urllib.request
 import urllib.error
+from html import escape as _h
+
 
 # ---------------------------------------------------------------------------
-# Embedded frontend
+# HTML rendering
 # ---------------------------------------------------------------------------
 
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>peek</title>
-<style>
+_CSS = """\
 :root {
     --bg: #1a1a2e;
     --bg2: #16213e;
@@ -55,27 +51,23 @@ body {
     flex-shrink: 0;
     flex-wrap: wrap;
 }
-#breadcrumb span {
-    color: var(--fg-dim);
-    font-size: 14px;
-}
+#breadcrumb span { color: var(--fg-dim); font-size: 14px; }
 #breadcrumb a {
     color: var(--accent);
     text-decoration: none;
     font-size: 14px;
-    cursor: pointer;
     padding: 2px 4px;
     border-radius: 3px;
 }
 #breadcrumb a:hover { background: var(--hover); }
-#breadcrumb a.current { color: var(--fg); cursor: default; }
-
+#breadcrumb a.current { color: var(--fg); cursor: default; pointer-events: none; }
 #listing {
     flex: 1;
     overflow-y: auto;
     padding: 8px 0;
     max-width: 800px;
 }
+a.entry { text-decoration: none; color: inherit; }
 .entry {
     display: flex;
     align-items: center;
@@ -110,7 +102,6 @@ body {
 .entry.state-local .badge { background: rgba(231,111,81,0.15); color: var(--red); }
 .entry.state-stale .badge { background: rgba(87,204,153,0.10); color: var(--green); }
 .entry.state-syncing .badge { background: rgba(78,168,222,0.15); color: var(--blue); }
-
 #status {
     background: var(--bg2);
     padding: 8px 16px;
@@ -120,8 +111,6 @@ body {
     flex-shrink: 0;
     min-height: 32px;
 }
-
-/* Context menu */
 #ctx-menu {
     display: none;
     position: fixed;
@@ -141,8 +130,6 @@ body {
 }
 #ctx-menu .ctx-item:hover { background: var(--hover); }
 #ctx-menu .ctx-item.danger { color: var(--red); }
-
-/* Modal */
 .modal-overlay {
     display: none;
     position: fixed;
@@ -191,89 +178,39 @@ body {
 .btn-confirm:hover { opacity: 0.9; }
 .btn-danger { background: var(--red); color: #fff; font-weight: 600; }
 .btn-danger:hover { opacity: 0.9; }
-
 .empty-msg {
     padding: 40px 16px;
     text-align: center;
     color: var(--fg-dim);
     font-size: 14px;
 }
-
-/* Folder picker */
-#folder-picker {
-    display: none;
-    padding: 40px 16px;
-    max-width: 600px;
-}
-#folder-picker h2 {
-    font-size: 18px;
-    margin-bottom: 8px;
-}
-#folder-picker p {
-    font-size: 13px;
-    color: var(--fg-dim);
-    margin-bottom: 20px;
-}
-.folder-item {
+#folder-picker { padding: 40px 16px; max-width: 600px; }
+#folder-picker h2 { font-size: 18px; margin-bottom: 8px; }
+#folder-picker p { font-size: 13px; color: var(--fg-dim); margin-bottom: 20px; }
+a.folder-item {
     display: flex;
     flex-direction: column;
     padding: 12px 16px;
-    cursor: pointer;
     border-radius: 6px;
     margin-bottom: 4px;
     transition: background 0.1s;
+    text-decoration: none;
+    color: inherit;
 }
-.folder-item:hover { background: var(--hover); }
+a.folder-item:hover { background: var(--hover); }
 .folder-item .folder-label { font-size: 14px; color: var(--fg); }
 .folder-item .folder-path { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
-</style>
-</head>
-<body>
+"""
 
-<div id="folder-picker"></div>
-<div id="breadcrumb"></div>
-<div id="listing"></div>
-<div id="status"></div>
-
-<div id="ctx-menu"><!-- filled by JS --></div>
-
-<div class="modal-overlay" id="confirm-modal">
-  <div class="modal">
-    <h3 id="confirm-title">Confirm</h3>
-    <p id="confirm-msg"></p>
-    <div class="modal-buttons">
-      <button class="btn-cancel" onclick="closeModals()">Cancel</button>
-      <button class="btn-danger" id="confirm-btn">Confirm</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-overlay" id="rename-modal">
-  <div class="modal">
-    <h3>Rename</h3>
-    <p id="rename-msg"></p>
-    <input type="text" id="rename-input">
-    <div class="modal-buttons">
-      <button class="btn-cancel" onclick="closeModals()">Cancel</button>
-      <button class="btn-confirm" id="rename-btn">Rename</button>
-    </div>
-  </div>
-</div>
-
-<script>
-let currentPath = '';
-let entries = [];
+_JS = """\
 let ctxEntry = null;
-
-const $listing = document.getElementById('listing');
-const $breadcrumb = document.getElementById('breadcrumb');
 const $status = document.getElementById('status');
 const $ctx = document.getElementById('ctx-menu');
-
 let syncPollId = null;
 let wasSyncing = false;
 
 function status(msg) {
+    if (!$status) return;
     $status.textContent = msg;
     clearTimeout(status._t);
     status._t = setTimeout(() => { $status.textContent = ''; }, 4000);
@@ -286,18 +223,30 @@ function formatBytes(b) {
     return (b / 1073741824).toFixed(1) + ' GiB';
 }
 
+async function postApi(path, body) {
+    const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+        const t = await r.text();
+        throw new Error(t || r.statusText);
+    }
+    return r.json();
+}
+
 async function pollCompletion() {
     try {
-        const data = await api('GET', '/api/completion');
+        const r = await fetch('/api/completion?folder=' + encodeURIComponent(FOLDER));
+        if (!r.ok) return;
+        const data = await r.json();
         if (data.completion >= 100) {
-            $status.textContent = '';
-            if (wasSyncing) {
-                wasSyncing = false;
-                navigate(currentPath);
-            }
+            if ($status) $status.textContent = '';
+            if (wasSyncing) { wasSyncing = false; location.reload(); }
         } else {
             wasSyncing = true;
-            $status.textContent = 'Syncing \u2014 ' + Math.floor(data.completion) + '% (' + data.needItems + ' items, ' + formatBytes(data.needBytes) + ' remaining)';
+            if ($status) $status.textContent = 'Syncing \u2014 ' + Math.floor(data.completion) + '% (' + data.needItems + ' items, ' + formatBytes(data.needBytes) + ' remaining)';
         }
     } catch {}
 }
@@ -308,166 +257,77 @@ function startSyncPoll() {
     syncPollId = setInterval(pollCompletion, 1500);
 }
 
-async function api(method, path, body) {
-    const opts = { method };
-    if (body) {
-        opts.headers = { 'Content-Type': 'application/json' };
-        opts.body = JSON.stringify(body);
-    }
-    const r = await fetch(path, opts);
-    if (!r.ok) {
-        const t = await r.text();
-        throw new Error(t || r.statusText);
-    }
-    return r.json();
-}
-
-function renderBreadcrumb() {
-    let html = '';
-    const parts = currentPath ? currentPath.split('/') : [];
-    html += `<a onclick="navigate('')">(root)</a>`;
-    let accum = '';
-    for (let i = 0; i < parts.length; i++) {
-        accum += (accum ? '/' : '') + parts[i];
-        html += `<span>/</span>`;
-        if (i === parts.length - 1) {
-            html += `<a class="current">${esc(parts[i])}</a>`;
-        } else {
-            const p = accum;
-            html += `<a onclick="navigate('${escAttr(p)}')">${esc(parts[i])}</a>`;
-        }
-    }
-    $breadcrumb.innerHTML = html;
-}
-
-function stateIcon(state) {
-    if (state === 'synced') return '&#9679;';
-    if (state === 'local') return '&#9679;';
-    return '&#9675;';
-}
-
-function renderListing() {
-    if (entries.length === 0) {
-        $listing.innerHTML = '<div class="empty-msg">Empty directory</div>';
-        return;
-    }
-    let html = '';
-    for (const e of entries) {
-        const cls = `state-${e.state}`;
-        html += `<div class="entry ${cls}" data-path="${escAttr(e.rel_path)}" data-dir="${e.is_dir}" data-state="${e.state}" data-name="${escAttr(e.name)}"`;
-        if (e.is_dir) {
-            html += ` onclick="navigate('${escAttr(e.rel_path)}')"`;
-        }
-        html += ` oncontextmenu="showCtx(event, this)">`;
-        html += `<span class="icon">${e.is_dir ? '&#128193;' : '&#128196;'}</span>`;
-        html += `<span class="name">${esc(e.name)}</span>`;
-        if (e.state !== 'remote') {
-            html += `<span class="badge">${e.state}</span>`;
-        }
-        html += `</div>`;
-    }
-    $listing.innerHTML = html;
-}
-
-async function navigate(path) {
-    currentPath = path;
-    renderBreadcrumb();
-    try {
-        const data = await api('GET', '/api/ls?path=' + encodeURIComponent(path));
-        entries = data.entries;
-        renderListing();
-    } catch (err) {
-        $listing.innerHTML = `<div class="empty-msg">Error: ${esc(err.message)}</div>`;
-        status('Error: ' + err.message);
-    }
-}
-
 function showCtx(ev, el) {
     ev.preventDefault();
     ev.stopPropagation();
-    const path = el.dataset.path;
-    const isDir = el.dataset.dir === 'true';
-    const state = el.dataset.state;
-    const name = el.dataset.name;
-    ctxEntry = { path, isDir, state, name };
-
+    ctxEntry = {
+        path: el.dataset.path,
+        isDir: el.dataset.dir === 'true',
+        state: el.dataset.state,
+        name: el.dataset.name
+    };
     let html = '';
-    if (state === 'remote') {
-        html += `<div class="ctx-item" onclick="doSync()">Start syncing</div>`;
-    } else if (state === 'synced') {
-        html += `<div class="ctx-item danger" onclick="doUnsync()">Stop syncing</div>`;
-        if (isDir) html += `<div class="ctx-item" onclick="doRename()">Rename</div>`;
-    } else if (state === 'inherited') {
-        html += `<div class="ctx-item" style="color:var(--fg-dim);cursor:default">Synced via parent folder</div>`;
-    } else if (state === 'local') {
-        html += `<div class="ctx-item" onclick="doSync()">Start syncing</div>`;
-    } else if (state === 'syncing') {
-        html += `<div class="ctx-item danger" onclick="doUnsync()">Stop syncing</div>`;
-    } else if (state === 'stale') {
-        html += `<div class="ctx-item danger" onclick="doUnsync()">Remove from whitelist</div>`;
+    const s = ctxEntry.state;
+    if (s === 'remote') {
+        html += '<div class="ctx-item" onclick="doSync()">Start syncing</div>';
+    } else if (s === 'synced') {
+        html += '<div class="ctx-item danger" onclick="doUnsync()">Stop syncing</div>';
+        if (ctxEntry.isDir) html += '<div class="ctx-item" onclick="doRename()">Rename</div>';
+    } else if (s === 'inherited') {
+        html += '<div class="ctx-item" style="color:var(--fg-dim);cursor:default">Synced via parent folder</div>';
+    } else if (s === 'local') {
+        html += '<div class="ctx-item" onclick="doSync()">Start syncing</div>';
+    } else if (s === 'syncing') {
+        html += '<div class="ctx-item danger" onclick="doUnsync()">Stop syncing</div>';
+    } else if (s === 'stale') {
+        html += '<div class="ctx-item danger" onclick="doUnsync()">Remove from whitelist</div>';
     }
-    if (!html) {
-        hideCtx();
-        return;
-    }
+    if (!html) { hideCtx(); return; }
     $ctx.innerHTML = html;
     $ctx.style.display = 'block';
-    // Position
     let x = ev.clientX, y = ev.clientY;
-    const rect = $ctx.getBoundingClientRect();
     if (x + 200 > window.innerWidth) x = window.innerWidth - 200;
     if (y + 150 > window.innerHeight) y = window.innerHeight - 150;
     $ctx.style.left = x + 'px';
     $ctx.style.top = y + 'px';
 }
 
-function hideCtx() {
-    $ctx.style.display = 'none';
-}
+function hideCtx() { $ctx.style.display = 'none'; }
 
-document.addEventListener('click', (e) => {
-    if (!$ctx.contains(e.target)) hideCtx();
-});
+document.addEventListener('click', e => { if (!$ctx.contains(e.target)) hideCtx(); });
 
 async function doSync() {
-    const entry = ctxEntry;
-    hideCtx();
+    const entry = ctxEntry; hideCtx();
     if (!entry) return;
     try {
-        await api('POST', '/api/whitelist/add', { path: entry.path });
+        await postApi('/api/whitelist/add', { folder: FOLDER, path: entry.path });
         status('Added to sync: ' + entry.path);
-        navigate(currentPath);
-    } catch (err) {
-        status('Error: ' + err.message);
-    }
+        location.reload();
+    } catch (err) { status('Error: ' + err.message); }
 }
 
 function doUnsync() {
-    const entry = ctxEntry;
-    hideCtx();
+    const entry = ctxEntry; hideCtx();
     if (!entry) return;
     document.getElementById('confirm-title').textContent = 'Stop syncing';
     document.getElementById('confirm-msg').textContent =
-        `Remove "${entry.path}" from whitelist? The local copy will be deleted.`;
+        'Remove "' + entry.path + '" from whitelist? The local copy will be deleted.';
     const btn = document.getElementById('confirm-btn');
     btn.onclick = async () => {
         closeModals();
         try {
-            await api('POST', '/api/whitelist/remove', { path: entry.path });
+            await postApi('/api/whitelist/remove', { folder: FOLDER, path: entry.path });
             status('Removed from sync: ' + entry.path);
-            navigate(currentPath);
-        } catch (err) {
-            status('Error: ' + err.message);
-        }
+            location.reload();
+        } catch (err) { status('Error: ' + err.message); }
     };
     document.getElementById('confirm-modal').classList.add('active');
 }
 
 function doRename() {
-    const entry = ctxEntry;
-    hideCtx();
+    const entry = ctxEntry; hideCtx();
     if (!entry) return;
-    document.getElementById('rename-msg').textContent = `Rename "${entry.name}":`;
+    document.getElementById('rename-msg').textContent = 'Rename "' + entry.name + '":';
     const inp = document.getElementById('rename-input');
     inp.value = entry.name;
     const btn = document.getElementById('rename-btn');
@@ -475,17 +335,14 @@ function doRename() {
         const newName = inp.value.trim();
         if (!newName || newName === entry.name) { closeModals(); return; }
         closeModals();
-        // Build new path: same parent, new name
         const parts = entry.path.split('/');
         parts[parts.length - 1] = newName;
         const newPath = parts.join('/');
         try {
-            await api('POST', '/api/rename', { old_path: entry.path, new_path: newPath });
-            status('Renamed: ' + entry.name + ' → ' + newName);
-            navigate(currentPath);
-        } catch (err) {
-            status('Error: ' + err.message);
-        }
+            await postApi('/api/rename', { folder: FOLDER, old_path: entry.path, new_path: newPath });
+            status('Renamed: ' + entry.name + ' \u2192 ' + newName);
+            location.reload();
+        } catch (err) { status('Error: ' + err.message); }
     };
     document.getElementById('rename-modal').classList.add('active');
     setTimeout(() => { inp.focus(); inp.select(); }, 50);
@@ -495,68 +352,119 @@ function closeModals() {
     document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('active'));
 }
 
-document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeModals();
-});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModals(); });
 
-function esc(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-function escAttr(s) {
-    return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
-}
+if (typeof FOLDER !== 'undefined') startSyncPoll();
+"""
 
-// Boot
-const $picker = document.getElementById('folder-picker');
 
-function showPicker(folders) {
-    $breadcrumb.style.display = 'none';
-    $listing.style.display = 'none';
-    $status.style.display = 'none';
-    let html = '<h2>Select a Syncthing folder</h2><p>Choose which folder to manage:</p>';
-    for (const f of folders) {
-        const label = f.label || f.id;
-        html += `<div class="folder-item" onclick="selectFolder('${escAttr(f.id)}')">`;
-        html += `<span class="folder-label">${esc(label)}</span>`;
-        html += `<span class="folder-path">${esc(f.path)}</span>`;
-        html += `</div>`;
-    }
-    $picker.innerHTML = html;
-    $picker.style.display = 'block';
-}
+def _render_page(title, body_html, folder_id=None):
+    """Wrap content in full HTML page with CSS, modals, and JS."""
+    folder_js = f"const FOLDER = {json.dumps(folder_id)};\n" if folder_id else ""
+    return (
+        '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'<title>{_h(title)}</title>\n'
+        f'<style>{_CSS}</style>\n'
+        '</head>\n<body>\n'
+        f'{body_html}\n'
+        '<div id="ctx-menu"></div>\n'
+        '<div class="modal-overlay" id="confirm-modal">\n'
+        '  <div class="modal">\n'
+        '    <h3 id="confirm-title">Confirm</h3>\n'
+        '    <p id="confirm-msg"></p>\n'
+        '    <div class="modal-buttons">\n'
+        '      <button class="btn-cancel" onclick="closeModals()">Cancel</button>\n'
+        '      <button class="btn-danger" id="confirm-btn">Confirm</button>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '</div>\n'
+        '<div class="modal-overlay" id="rename-modal">\n'
+        '  <div class="modal">\n'
+        '    <h3>Rename</h3>\n'
+        '    <p id="rename-msg"></p>\n'
+        '    <input type="text" id="rename-input">\n'
+        '    <div class="modal-buttons">\n'
+        '      <button class="btn-cancel" onclick="closeModals()">Cancel</button>\n'
+        '      <button class="btn-confirm" id="rename-btn">Rename</button>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '</div>\n'
+        f'<script>\n{folder_js}{_JS}</script>\n'
+        '</body>\n</html>'
+    )
 
-async function selectFolder(id) {
-    try {
-        await api('POST', '/api/select-folder', { folder_id: id });
-        boot();
-    } catch (err) {
-        status('Error: ' + err.message);
-    }
-}
 
-async function boot() {
-    try {
-        const data = await api('GET', '/api/status');
-        if (data.configured) {
-            $picker.style.display = 'none';
-            $breadcrumb.style.display = '';
-            $listing.style.display = '';
-            $status.style.display = '';
-            document.title = 'peek(' + data.folder_id + ')';
-            navigate('');
-            startSyncPoll();
-        } else {
-            showPicker(data.folders);
-        }
-    } catch (err) {
-        $listing.innerHTML = `<div class="empty-msg">Error: ${esc(err.message)}</div>`;
-    }
-}
+def _render_picker(folders):
+    """Generate folder picker body HTML."""
+    html = '<div id="folder-picker">\n'
+    html += '<h2>Select a Syncthing folder</h2>\n'
+    html += '<p>Choose which folder to manage:</p>\n'
+    for f in folders:
+        label = f.get("label") or f["id"]
+        href = '/' + urllib.parse.quote(f["id"], safe="") + '/'
+        html += (
+            f'<a href="{_h(href)}" class="folder-item">'
+            f'<span class="folder-label">{_h(label)}</span>'
+            f'<span class="folder-path">{_h(f["path"])}</span>'
+            f'</a>\n'
+        )
+    html += '</div>'
+    return html
 
-boot();
-</script>
-</body>
-</html>"""
+
+def _render_listing(folder_id, folder_label, rel, entries):
+    """Generate breadcrumb + entry list body HTML."""
+    qid = urllib.parse.quote(folder_id, safe="")
+
+    # Breadcrumb
+    bc = '<div id="breadcrumb">'
+    bc += '<a href="/">peek</a><span>/</span>'
+    if rel:
+        bc += f'<a href="/{_h(qid)}/">{_h(folder_label)}</a>'
+        parts = rel.split("/")
+        accum = ""
+        for i, part in enumerate(parts):
+            accum = (accum + "/" + part) if accum else part
+            bc += '<span>/</span>'
+            if i == len(parts) - 1:
+                bc += f'<a class="current">{_h(part)}</a>'
+            else:
+                href = '/' + qid + '/' + urllib.parse.quote(accum, safe="/") + '/'
+                bc += f'<a href="{_h(href)}">{_h(part)}</a>'
+    else:
+        bc += f'<a class="current">{_h(folder_label)}</a>'
+    bc += '</div>\n'
+
+    # Listing
+    ls = '<div id="listing">'
+    if not entries:
+        ls += '<div class="empty-msg">Empty directory</div>'
+    else:
+        for e in entries:
+            cls = 'state-' + e["state"]
+            attrs = (
+                f' data-path="{_h(e["rel_path"])}"'
+                f' data-dir="{str(e["is_dir"]).lower()}"'
+                f' data-state="{_h(e["state"])}"'
+                f' data-name="{_h(e["name"])}"'
+                f' oncontextmenu="showCtx(event,this)"'
+            )
+            icon = '&#128193;' if e["is_dir"] else '&#128196;'
+            badge = f'<span class="badge">{_h(e["state"])}</span>'
+            inner = (
+                f'<span class="icon">{icon}</span>'
+                f'<span class="name">{_h(e["name"])}</span>{badge}'
+            )
+            if e["is_dir"]:
+                href = '/' + qid + '/' + urllib.parse.quote(e["rel_path"], safe="/") + '/'
+                ls += f'<a href="{_h(href)}" class="entry {cls}"{attrs}>{inner}</a>'
+            else:
+                ls += f'<div class="entry {cls}"{attrs}>{inner}</div>'
+    ls += '</div>\n'
+
+    return bc + ls + '<div id="status"></div>'
 
 
 # ---------------------------------------------------------------------------
@@ -750,14 +658,11 @@ class SyncthingClient:
 # ---------------------------------------------------------------------------
 
 class NasUIHandler(http.server.BaseHTTPRequestHandler):
-    """Routes requests to the appropriate handler."""
+    """Stateless request handler — every request is self-contained."""
 
-    syncthing: SyncthingClient
-    stignore: StignoreManager | None = None
-    folder_id: str | None = None
+    syncthing: SyncthingClient  # set once by main()
 
     def log_message(self, format, *args):
-        # Quieter logging
         pass
 
     def _send_json(self, data, code=200):
@@ -784,122 +689,52 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _require_configured(self) -> bool:
-        """Return True if configured. Sends 503 and returns False if not."""
-        if self.stignore is None:
-            self._send_error(503, "No folder selected")
-            return False
-        return True
-
-    def _handle_status(self):
-        folders = self.syncthing.get_folders()
-        configured = self.stignore is not None
-        data = {"configured": configured, "folders": folders}
-        if configured:
-            data["folder_id"] = self.folder_id
-            data["folder_path"] = str(self.stignore.local_path)
-        self._send_json(data)
-
-    def _handle_select_folder(self):
-        body = self._read_body()
-        folder_id = body.get("folder_id", "")
-        if not folder_id:
-            self._send_error(400, "folder_id required")
-            return
-        folders = self.syncthing.get_folders()
-        folder = next((f for f in folders if f["id"] == folder_id), None)
-        if folder is None:
-            self._send_error(404, "Unknown folder id")
-            return
-        NasUIHandler.folder_id = folder_id
-        NasUIHandler.stignore = StignoreManager(self.syncthing, folder_id, folder["path"])
-        self._send_json({"ok": True, "folder_id": folder_id, "path": folder["path"]})
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length)) if length else {}
 
     def _validate_path(self, path: str) -> str:
-        """Normalize and validate a relative path. Returns normalized path or raises."""
+        """Normalize and validate a relative path."""
         path = path.strip("/")
         if not path:
             return ""
         normalized = os.path.normpath(path)
         if normalized.startswith("..") or os.path.isabs(normalized):
             raise ValueError("Invalid path")
-        # Reject any component that is ..
         for part in normalized.split(os.sep):
             if part == "..":
                 raise ValueError("Invalid path")
         return normalized
 
-    def _read_body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length)) if length else {}
+    def _resolve_folder(self, folder_id):
+        """Look up folder, return (folder_info, StignoreManager) or None."""
+        folders = self.syncthing.get_folders()
+        folder = next((f for f in folders if f["id"] == folder_id), None)
+        if folder is None:
+            return None
+        stignore = StignoreManager(self.syncthing, folder_id, folder["path"])
+        return folder, stignore
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-
-        if path == "/":
-            self._send_html(HTML_PAGE)
-        elif path == "/api/status":
-            self._handle_status()
-        elif path == "/api/ls":
-            if self._require_configured():
-                self._handle_ls(parsed)
-        elif path == "/api/whitelist":
-            if self._require_configured():
-                self._handle_whitelist()
-        elif path == "/api/completion":
-            if self._require_configured():
-                self._handle_completion()
-        else:
-            self._send_error(404, "Not found")
-
-    def do_POST(self):
-        path = urllib.parse.urlparse(self.path).path
-
-        if path == "/api/select-folder":
-            self._handle_select_folder()
-        elif path == "/api/whitelist/add":
-            if self._require_configured():
-                self._handle_add()
-        elif path == "/api/whitelist/remove":
-            if self._require_configured():
-                self._handle_remove()
-        elif path == "/api/rename":
-            if self._require_configured():
-                self._handle_rename()
-        else:
-            self._send_error(404, "Not found")
-
-    def _handle_ls(self, parsed):
-        qs = urllib.parse.parse_qs(parsed.query)
-        raw_path = qs.get("path", [""])[0]
-        try:
-            rel = self._validate_path(raw_path)
-        except ValueError:
-            self._send_error(400, "Invalid path")
-            return
-
-        syncthing_path = self.stignore.local_path
+    def _build_entries(self, folder_id, stignore, rel):
+        """Build the entry list for a directory listing."""
+        syncthing_path = stignore.local_path
+        whitelist = stignore.get_whitelist()
 
         # Check folder sync status
         try:
-            comp = self.syncthing.completion(self.folder_id)
+            comp = self.syncthing.completion(folder_id)
             folder_synced = comp.get("completion", 0) >= 100
         except Exception:
-            folder_synced = True  # assume synced if we can't reach the API
+            folder_synced = True
 
-        # Primary source: Syncthing global index via db/browse
-        try:
-            browse_entries = self.syncthing.browse(self.folder_id, rel)
-        except Exception as e:
-            self._send_error(502, f"Syncthing API error: {e}")
-            return
+        # Primary source: Syncthing global index
+        browse_entries = self.syncthing.browse(folder_id, rel)
 
         # Hide Syncthing internals at folder root
         if not rel:
-            browse_entries = [e for e in browse_entries if e.get("name") not in (".stignore", ".stfolder")]
+            browse_entries = [e for e in browse_entries
+                             if e.get("name") not in (".stignore", ".stfolder")]
 
-        # Sort dirs-first then alphabetical
         browse_entries.sort(
             key=lambda e: (e.get("type") != "FILE_INFO_TYPE_DIRECTORY", e["name"].lower())
         )
@@ -913,28 +748,34 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
             is_dir = item.get("type") == "FILE_INFO_TYPE_DIRECTORY"
 
             state = "remote"
-            wl_status = self.stignore.whitelist_status(item_rel)
+            wl_status = stignore.whitelist_status(item_rel)
             local_exists = (syncthing_path / item_rel).exists()
             if wl_status == "direct":
                 state = "synced" if folder_synced else "syncing"
             elif wl_status == "inherited":
                 state = "inherited" if folder_synced else "syncing"
             elif local_exists:
-                state = "local"
+                # A dir that only exists because a child is whitelisted
+                # (e.g. blender/ exists because blender/addons is synced)
+                # should stay remote, not show as local.
+                has_wl_child = is_dir and any(
+                    w.startswith(item_rel + "/") for w in whitelist
+                )
+                state = "remote" if has_wl_child else "local"
 
             entries.append({
                 "name": name,
                 "rel_path": item_rel,
                 "is_dir": is_dir,
                 "state": state,
-                "has_children": True if is_dir else False,
             })
 
         # Merge local-only entries not in global index
         local_dir = syncthing_path / rel if rel else syncthing_path
         if local_dir.is_dir():
             try:
-                local_items = sorted(local_dir.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                local_items = sorted(local_dir.iterdir(),
+                                     key=lambda p: (not p.is_dir(), p.name.lower()))
             except PermissionError:
                 local_items = []
             for item in local_items:
@@ -943,23 +784,25 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 item_rel = (rel + "/" + name) if rel else name
                 is_dir = item.is_dir()
-                wl_status = self.stignore.whitelist_status(item_rel)
+                wl_status = stignore.whitelist_status(item_rel)
                 if wl_status == "direct":
                     state = "synced" if folder_synced else "syncing"
                 elif wl_status == "inherited":
                     state = "inherited" if folder_synced else "syncing"
                 else:
-                    state = "local"
+                    has_wl_child = is_dir and any(
+                        w.startswith(item_rel + "/") for w in whitelist
+                    )
+                    state = "remote" if has_wl_child else "local"
                 entries.append({
                     "name": name,
                     "rel_path": item_rel,
                     "is_dir": is_dir,
                     "state": state,
-                    "has_children": True if is_dir else False,
                 })
 
-        # Detect stale whitelist entries (whitelisted but absent from index and disk)
-        for w in self.stignore.get_whitelist():
+        # Detect stale whitelist entries
+        for w in stignore.get_whitelist():
             if rel:
                 if not w.startswith(rel + "/"):
                     continue
@@ -971,24 +814,93 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                 seen.add(name)
                 item_rel = (rel + "/" + name) if rel else name
                 is_dir = "/" in remainder or any(
-                    w2.startswith(item_rel + "/") for w2 in self.stignore.get_whitelist()
+                    w2.startswith(item_rel + "/") for w2 in stignore.get_whitelist()
                 )
                 entries.append({
                     "name": name,
                     "rel_path": item_rel,
                     "is_dir": is_dir,
                     "state": "stale",
-                    "has_children": is_dir,
                 })
 
-        self._send_json({"entries": entries})
+        # Sort: remote first, then synced/inherited/syncing, then local, then stale;
+        # within each group dirs-first then alphabetical
+        state_order = {"remote": 0, "syncing": 1, "synced": 2, "inherited": 3, "local": 4, "stale": 5}
+        entries.sort(key=lambda e: (state_order.get(e["state"], 9), not e["is_dir"], e["name"].lower()))
+        return entries
 
-    def _handle_whitelist(self):
-        self._send_json({"whitelist": self.stignore.get_whitelist()})
+    # -- Routing -------------------------------------------------------------
 
-    def _handle_completion(self):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            folders = self.syncthing.get_folders()
+            self._send_html(_render_page("peek", _render_picker(folders)))
+            return
+
+        if path.startswith("/api/"):
+            if path == "/api/completion":
+                qs = urllib.parse.parse_qs(parsed.query)
+                folder_id = qs.get("folder", [""])[0]
+                if not folder_id:
+                    self._send_error(400, "folder required")
+                    return
+                self._handle_completion(folder_id)
+            else:
+                self._send_error(404, "Not found")
+            return
+
+        # /<folder_id>/sub/path/
+        stripped = path.strip("/")
+        if not stripped:
+            self._send_error(404, "Not found")
+            return
+
+        parts = stripped.split("/", 1)
+        folder_id = urllib.parse.unquote(parts[0])
+        sub_path = urllib.parse.unquote(parts[1]) if len(parts) > 1 else ""
+
+        result = self._resolve_folder(folder_id)
+        if result is None:
+            self._send_error(404, "Unknown folder")
+            return
+        folder, stignore = result
+
         try:
-            data = self.syncthing.completion(self.folder_id)
+            rel = self._validate_path(sub_path)
+        except ValueError:
+            self._send_error(400, "Invalid path")
+            return
+
+        try:
+            entries = self._build_entries(folder_id, stignore, rel)
+        except Exception as e:
+            self._send_error(502, f"Syncthing API error: {e}")
+            return
+
+        folder_label = folder.get("label") or folder["id"]
+        body = _render_listing(folder_id, folder_label, rel, entries)
+        self._send_html(_render_page(f"peek({folder_label})", body, folder_id=folder_id))
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+
+        if path == "/api/whitelist/add":
+            self._handle_add()
+        elif path == "/api/whitelist/remove":
+            self._handle_remove()
+        elif path == "/api/rename":
+            self._handle_rename()
+        else:
+            self._send_error(404, "Not found")
+
+    # -- API handlers --------------------------------------------------------
+
+    def _handle_completion(self, folder_id):
+        try:
+            data = self.syncthing.completion(folder_id)
             self._send_json({
                 "completion": data.get("completion", 0),
                 "needItems": data.get("needItems", 0),
@@ -999,6 +911,15 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_add(self):
         body = self._read_body()
+        folder_id = body.get("folder", "")
+        if not folder_id:
+            self._send_error(400, "folder required")
+            return
+        result = self._resolve_folder(folder_id)
+        if result is None:
+            self._send_error(404, "Unknown folder")
+            return
+        _, stignore = result
         raw = body.get("path", "")
         try:
             path = self._validate_path(raw)
@@ -1008,15 +929,24 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         if not path:
             self._send_error(400, "Path required")
             return
-        self.stignore.add(path)
+        stignore.add(path)
         try:
-            self.syncthing.trigger_scan(self.folder_id)
+            self.syncthing.trigger_scan(folder_id)
         except Exception:
             pass
         self._send_json({"ok": True})
 
     def _handle_remove(self):
         body = self._read_body()
+        folder_id = body.get("folder", "")
+        if not folder_id:
+            self._send_error(400, "folder required")
+            return
+        result = self._resolve_folder(folder_id)
+        if result is None:
+            self._send_error(404, "Unknown folder")
+            return
+        _, stignore = result
         raw = body.get("path", "")
         try:
             path = self._validate_path(raw)
@@ -1026,15 +956,24 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         if not path:
             self._send_error(400, "Path required")
             return
-        self.stignore.remove(path)
+        stignore.remove(path)
         try:
-            self.syncthing.trigger_scan(self.folder_id)
+            self.syncthing.trigger_scan(folder_id)
         except Exception:
             pass
         self._send_json({"ok": True})
 
     def _handle_rename(self):
         body = self._read_body()
+        folder_id = body.get("folder", "")
+        if not folder_id:
+            self._send_error(400, "folder required")
+            return
+        result = self._resolve_folder(folder_id)
+        if result is None:
+            self._send_error(404, "Unknown folder")
+            return
+        _, stignore = result
         try:
             old = self._validate_path(body.get("old_path", ""))
             new = self._validate_path(body.get("new_path", ""))
@@ -1045,12 +984,12 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(400, "Both old_path and new_path required")
             return
         try:
-            self.stignore.rename(old, new)
+            stignore.rename(old, new)
         except FileNotFoundError as e:
             self._send_error(409, str(e))
             return
         try:
-            self.syncthing.trigger_scan(self.folder_id)
+            self.syncthing.trigger_scan(folder_id)
         except Exception:
             pass
         self._send_json({"ok": True})
@@ -1074,14 +1013,12 @@ def main():
         folders = syncthing.get_folders()
     except Exception as e:
         parser.error(f"Cannot reach Syncthing at {args.syncthing_url}: {e}")
-    print(f"Connected to Syncthing — {len(folders)} folder(s) available")
+    print(f"Connected to Syncthing \u2014 {len(folders)} folder(s) available")
 
     NasUIHandler.syncthing = syncthing
-    NasUIHandler.stignore = None
-    NasUIHandler.folder_id = None
 
     server = http.server.HTTPServer((args.bind, args.port), NasUIHandler)
-    print(f"peek → http://{args.bind}:{args.port}")
+    print(f"peek \u2192 http://{args.bind}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
