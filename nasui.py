@@ -7,8 +7,9 @@ import json
 import argparse
 import shutil
 import os
-import tempfile
 import urllib.parse
+import urllib.request
+import urllib.error
 
 # ---------------------------------------------------------------------------
 # Embedded frontend
@@ -19,7 +20,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>peek({{SYNCTHING_PATH}})</title>
+<title>peek</title>
 <style>
 :root {
     --bg: #1a1a2e;
@@ -101,10 +102,14 @@ body {
 .entry.state-synced .name { color: var(--green); }
 .entry.state-inherited .name { color: var(--green); }
 .entry.state-local .name { color: var(--red); }
+.entry.state-stale .name { color: var(--green); }
+.entry.state-syncing .name { color: var(--blue); }
 .entry.state-remote .badge { background: rgba(78,168,222,0.15); color: var(--blue); }
 .entry.state-synced .badge { background: rgba(87,204,153,0.15); color: var(--green); }
 .entry.state-inherited .badge { background: rgba(87,204,153,0.10); color: var(--green); opacity: 0.7; }
 .entry.state-local .badge { background: rgba(231,111,81,0.15); color: var(--red); }
+.entry.state-stale .badge { background: rgba(87,204,153,0.10); color: var(--green); }
+.entry.state-syncing .badge { background: rgba(78,168,222,0.15); color: var(--blue); }
 
 #status {
     background: var(--bg2);
@@ -193,10 +198,39 @@ body {
     color: var(--fg-dim);
     font-size: 14px;
 }
+
+/* Folder picker */
+#folder-picker {
+    display: none;
+    padding: 40px 16px;
+    max-width: 600px;
+}
+#folder-picker h2 {
+    font-size: 18px;
+    margin-bottom: 8px;
+}
+#folder-picker p {
+    font-size: 13px;
+    color: var(--fg-dim);
+    margin-bottom: 20px;
+}
+.folder-item {
+    display: flex;
+    flex-direction: column;
+    padding: 12px 16px;
+    cursor: pointer;
+    border-radius: 6px;
+    margin-bottom: 4px;
+    transition: background 0.1s;
+}
+.folder-item:hover { background: var(--hover); }
+.folder-item .folder-label { font-size: 14px; color: var(--fg); }
+.folder-item .folder-path { font-size: 12px; color: var(--fg-dim); margin-top: 2px; }
 </style>
 </head>
 <body>
 
+<div id="folder-picker"></div>
 <div id="breadcrumb"></div>
 <div id="listing"></div>
 <div id="status"></div>
@@ -236,10 +270,42 @@ const $breadcrumb = document.getElementById('breadcrumb');
 const $status = document.getElementById('status');
 const $ctx = document.getElementById('ctx-menu');
 
+let syncPollId = null;
+let wasSyncing = false;
+
 function status(msg) {
     $status.textContent = msg;
     clearTimeout(status._t);
     status._t = setTimeout(() => { $status.textContent = ''; }, 4000);
+}
+
+function formatBytes(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KiB';
+    if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MiB';
+    return (b / 1073741824).toFixed(1) + ' GiB';
+}
+
+async function pollCompletion() {
+    try {
+        const data = await api('GET', '/api/completion');
+        if (data.completion >= 100) {
+            $status.textContent = '';
+            if (wasSyncing) {
+                wasSyncing = false;
+                navigate(currentPath);
+            }
+        } else {
+            wasSyncing = true;
+            $status.textContent = 'Syncing \u2014 ' + Math.floor(data.completion) + '% (' + data.needItems + ' items, ' + formatBytes(data.needBytes) + ' remaining)';
+        }
+    } catch {}
+}
+
+function startSyncPoll() {
+    if (syncPollId) return;
+    pollCompletion();
+    syncPollId = setInterval(pollCompletion, 1500);
 }
 
 async function api(method, path, body) {
@@ -335,6 +401,10 @@ function showCtx(ev, el) {
         html += `<div class="ctx-item" style="color:var(--fg-dim);cursor:default">Synced via parent folder</div>`;
     } else if (state === 'local') {
         html += `<div class="ctx-item" onclick="doSync()">Start syncing</div>`;
+    } else if (state === 'syncing') {
+        html += `<div class="ctx-item danger" onclick="doUnsync()">Stop syncing</div>`;
+    } else if (state === 'stale') {
+        html += `<div class="ctx-item danger" onclick="doUnsync()">Remove from whitelist</div>`;
     }
     if (!html) {
         hideCtx();
@@ -437,7 +507,53 @@ function escAttr(s) {
 }
 
 // Boot
-navigate('');
+const $picker = document.getElementById('folder-picker');
+
+function showPicker(folders) {
+    $breadcrumb.style.display = 'none';
+    $listing.style.display = 'none';
+    $status.style.display = 'none';
+    let html = '<h2>Select a Syncthing folder</h2><p>Choose which folder to manage:</p>';
+    for (const f of folders) {
+        const label = f.label || f.id;
+        html += `<div class="folder-item" onclick="selectFolder('${escAttr(f.id)}')">`;
+        html += `<span class="folder-label">${esc(label)}</span>`;
+        html += `<span class="folder-path">${esc(f.path)}</span>`;
+        html += `</div>`;
+    }
+    $picker.innerHTML = html;
+    $picker.style.display = 'block';
+}
+
+async function selectFolder(id) {
+    try {
+        await api('POST', '/api/select-folder', { folder_id: id });
+        boot();
+    } catch (err) {
+        status('Error: ' + err.message);
+    }
+}
+
+async function boot() {
+    try {
+        const data = await api('GET', '/api/status');
+        if (data.configured) {
+            $picker.style.display = 'none';
+            $breadcrumb.style.display = '';
+            $listing.style.display = '';
+            $status.style.display = '';
+            document.title = 'peek(' + data.folder_id + ')';
+            navigate('');
+            startSyncPoll();
+        } else {
+            showPicker(data.folders);
+        }
+    } catch (err) {
+        $listing.innerHTML = `<div class="empty-msg">Error: ${esc(err.message)}</div>`;
+    }
+}
+
+boot();
 </script>
 </body>
 </html>"""
@@ -448,25 +564,26 @@ navigate('');
 # ---------------------------------------------------------------------------
 
 class StignoreManager:
-    """Parses and manages a Syncthing .stignore whitelist file."""
+    """Manages a Syncthing .stignore whitelist via the REST API."""
 
-    DEFAULT_CONTENT = "#include globalstignore.txt\n\n# -- Whitelists\n\n*\n"
+    DEFAULT_LINES = ["#include globalstignore.txt", "", "# -- Whitelists", "", "*"]
     HEADER_MARKER = "# -- Whitelists"
 
-    def __init__(self, syncthing_path: str):
-        self.syncthing_path = pathlib.Path(syncthing_path)
-        self.stignore_path = self.syncthing_path / ".stignore"
-        self._ensure_exists()
+    def __init__(self, syncthing: 'SyncthingClient', folder_id: str, local_path: str):
+        self.syncthing = syncthing
+        self.folder_id = folder_id
+        self.local_path = pathlib.Path(local_path).expanduser()
+        self._ensure_initialized()
 
-    def _ensure_exists(self):
-        self.syncthing_path.mkdir(parents=True, exist_ok=True)
-        if not self.stignore_path.exists():
-            self._write_raw(self.DEFAULT_CONTENT)
+    def _ensure_initialized(self):
+        """Ensure .stignore has the whitelist structure."""
+        lines = self.syncthing.get_ignores(self.folder_id)
+        if not any(line.strip() == self.HEADER_MARKER for line in lines):
+            self.syncthing.set_ignores(self.folder_id, self.DEFAULT_LINES)
 
     def _parse(self):
         """Parse .stignore into (preamble_lines, whitelist_set, catchall_lines)."""
-        text = self.stignore_path.read_text()
-        lines = text.splitlines()
+        lines = self.syncthing.get_ignores(self.folder_id)
 
         preamble = []
         whitelist = set()
@@ -502,27 +619,13 @@ class StignoreManager:
         return preamble, whitelist, catchall
 
     def _write(self, preamble, whitelist, catchall):
-        """Write .stignore atomically."""
+        """Write .stignore via Syncthing API."""
         lines = list(preamble)
         for path in sorted(whitelist):
             lines.append("!/" + path)
         lines.append("")
         lines.extend(catchall)
-        content = "\n".join(lines) + "\n"
-        self._write_raw(content)
-
-    def _write_raw(self, content: str):
-        """Atomic write via temp file + os.replace."""
-        fd, tmp = tempfile.mkstemp(dir=str(self.syncthing_path), suffix=".stignore.tmp")
-        try:
-            os.write(fd, content.encode())
-            os.close(fd)
-            os.replace(tmp, str(self.stignore_path))
-        except Exception:
-            os.close(fd) if not os.get_inheritable(fd) else None
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
+        self.syncthing.set_ignores(self.folder_id, lines)
 
     def get_whitelist(self) -> list:
         _, whitelist, _ = self._parse()
@@ -558,7 +661,7 @@ class StignoreManager:
         whitelist = {w for w in whitelist if w != path and not w.startswith(path + "/")}
         self._write(preamble, whitelist, catchall)
         # Delete local copy
-        local = self.syncthing_path / path
+        local = self.local_path / path
         if local.is_dir():
             shutil.rmtree(str(local))
         elif local.exists():
@@ -576,8 +679,8 @@ class StignoreManager:
             else:
                 updated.add(w)
         # Rename local directory
-        local_old = self.syncthing_path / old_path
-        local_new = self.syncthing_path / new_path
+        local_old = self.local_path / old_path
+        local_new = self.local_path / new_path
         if not local_old.exists():
             raise FileNotFoundError(
                 f"Local copy not found: {old_path}. Wait for sync to complete before renaming."
@@ -588,14 +691,70 @@ class StignoreManager:
 
 
 # ---------------------------------------------------------------------------
+# Syncthing REST API client
+# ---------------------------------------------------------------------------
+
+class SyncthingClient:
+    """Thin wrapper around the Syncthing REST API (stdlib only)."""
+
+    def __init__(self, api_key: str, base_url: str = "http://127.0.0.1:8384"):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+
+    def _request(self, method: str, path: str, body=None):
+        url = self.base_url + path
+        headers = {"X-API-Key": self.api_key}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, method=method, headers=headers, data=data)
+        with urllib.request.urlopen(req) as resp:
+            resp_body = resp.read()
+            return json.loads(resp_body) if resp_body else None
+
+    def get_folders(self) -> list:
+        """Return list of {id, label, path} from Syncthing config."""
+        folders = self._request("GET", "/rest/config/folders")
+        return [{"id": f["id"], "label": f.get("label", ""), "path": f["path"]}
+                for f in folders]
+
+    def browse(self, folder_id: str, prefix: str = "") -> list:
+        """Return entries from db/browse for a folder (flat, one level)."""
+        path = "/rest/db/browse?folder=" + urllib.parse.quote(folder_id) + "&levels=0"
+        if prefix:
+            path += "&prefix=" + urllib.parse.quote(prefix)
+        return self._request("GET", path) or []
+
+    def get_ignores(self, folder_id: str) -> list:
+        """Return the raw .stignore lines for a folder."""
+        data = self._request("GET", "/rest/db/ignores?folder=" + urllib.parse.quote(folder_id))
+        return data.get("ignore", []) if data else []
+
+    def set_ignores(self, folder_id: str, lines: list):
+        """Replace .stignore content for a folder."""
+        self._request("POST", "/rest/db/ignores?folder=" + urllib.parse.quote(folder_id),
+                       body={"ignore": lines})
+
+    def completion(self, folder_id: str) -> dict:
+        """Return aggregate completion for a folder across all devices."""
+        return self._request("GET", "/rest/db/completion?folder=" + urllib.parse.quote(folder_id))
+
+    def trigger_scan(self, folder_id: str):
+        """Ask Syncthing to rescan a folder."""
+        self._request("POST", "/rest/db/scan?folder=" + urllib.parse.quote(folder_id))
+
+
+# ---------------------------------------------------------------------------
 # HTTP Handler
 # ---------------------------------------------------------------------------
 
 class NasUIHandler(http.server.BaseHTTPRequestHandler):
     """Routes requests to the appropriate handler."""
 
-    nfs_path: pathlib.Path
-    stignore: StignoreManager
+    syncthing: SyncthingClient
+    stignore: StignoreManager | None = None
+    folder_id: str | None = None
 
     def log_message(self, format, *args):
         # Quieter logging
@@ -625,6 +784,37 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _require_configured(self) -> bool:
+        """Return True if configured. Sends 503 and returns False if not."""
+        if self.stignore is None:
+            self._send_error(503, "No folder selected")
+            return False
+        return True
+
+    def _handle_status(self):
+        folders = self.syncthing.get_folders()
+        configured = self.stignore is not None
+        data = {"configured": configured, "folders": folders}
+        if configured:
+            data["folder_id"] = self.folder_id
+            data["folder_path"] = str(self.stignore.local_path)
+        self._send_json(data)
+
+    def _handle_select_folder(self):
+        body = self._read_body()
+        folder_id = body.get("folder_id", "")
+        if not folder_id:
+            self._send_error(400, "folder_id required")
+            return
+        folders = self.syncthing.get_folders()
+        folder = next((f for f in folders if f["id"] == folder_id), None)
+        if folder is None:
+            self._send_error(404, "Unknown folder id")
+            return
+        NasUIHandler.folder_id = folder_id
+        NasUIHandler.stignore = StignoreManager(self.syncthing, folder_id, folder["path"])
+        self._send_json({"ok": True, "folder_id": folder_id, "path": folder["path"]})
+
     def _validate_path(self, path: str) -> str:
         """Normalize and validate a relative path. Returns normalized path or raises."""
         path = path.strip("/")
@@ -648,23 +838,35 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == "/":
-            self._send_html(HTML_PAGE.replace("{{SYNCTHING_PATH}}", str(self.stignore.syncthing_path)))
+            self._send_html(HTML_PAGE)
+        elif path == "/api/status":
+            self._handle_status()
         elif path == "/api/ls":
-            self._handle_ls(parsed)
+            if self._require_configured():
+                self._handle_ls(parsed)
         elif path == "/api/whitelist":
-            self._handle_whitelist()
+            if self._require_configured():
+                self._handle_whitelist()
+        elif path == "/api/completion":
+            if self._require_configured():
+                self._handle_completion()
         else:
             self._send_error(404, "Not found")
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
 
-        if path == "/api/whitelist/add":
-            self._handle_add()
+        if path == "/api/select-folder":
+            self._handle_select_folder()
+        elif path == "/api/whitelist/add":
+            if self._require_configured():
+                self._handle_add()
         elif path == "/api/whitelist/remove":
-            self._handle_remove()
+            if self._require_configured():
+                self._handle_remove()
         elif path == "/api/rename":
-            self._handle_rename()
+            if self._require_configured():
+                self._handle_rename()
         else:
             self._send_error(404, "Not found")
 
@@ -677,58 +879,58 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(400, "Invalid path")
             return
 
-        syncthing_path = self.stignore.syncthing_path
-        nfs_target = self.nfs_path / rel if rel else self.nfs_path
-        local_target = syncthing_path / rel if rel else syncthing_path
-        if not nfs_target.is_dir() and not local_target.is_dir():
-            self._send_error(404, "Directory not found")
+        syncthing_path = self.stignore.local_path
+
+        # Check folder sync status
+        try:
+            comp = self.syncthing.completion(self.folder_id)
+            folder_synced = comp.get("completion", 0) >= 100
+        except Exception:
+            folder_synced = True  # assume synced if we can't reach the API
+
+        # Primary source: Syncthing global index via db/browse
+        try:
+            browse_entries = self.syncthing.browse(self.folder_id, rel)
+        except Exception as e:
+            self._send_error(502, f"Syncthing API error: {e}")
             return
 
-        entries = []
-        if nfs_target.is_dir():
-            try:
-                items = sorted(nfs_target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-            except PermissionError:
-                self._send_error(403, "Permission denied")
-                return
-        else:
-            items = []
+        # Hide Syncthing internals at folder root
+        if not rel:
+            browse_entries = [e for e in browse_entries if e.get("name") not in (".stignore", ".stfolder")]
 
+        # Sort dirs-first then alphabetical
+        browse_entries.sort(
+            key=lambda e: (e.get("type") != "FILE_INFO_TYPE_DIRECTORY", e["name"].lower())
+        )
+
+        entries = []
         seen = set()
-        for item in items:
-            name = item.name
-            if name.startswith("."):
-                continue
+        for item in browse_entries:
+            name = item["name"]
             seen.add(name)
             item_rel = (rel + "/" + name) if rel else name
-            is_dir = item.is_dir()
+            is_dir = item.get("type") == "FILE_INFO_TYPE_DIRECTORY"
 
             state = "remote"
             wl_status = self.stignore.whitelist_status(item_rel)
             local_exists = (syncthing_path / item_rel).exists()
             if wl_status == "direct":
-                state = "synced"
+                state = "synced" if folder_synced else "syncing"
             elif wl_status == "inherited":
-                state = "inherited"
+                state = "inherited" if folder_synced else "syncing"
             elif local_exists:
                 state = "local"
-
-            has_children = False
-            if is_dir:
-                try:
-                    has_children = any(True for _ in item.iterdir())
-                except PermissionError:
-                    pass
 
             entries.append({
                 "name": name,
                 "rel_path": item_rel,
                 "is_dir": is_dir,
                 "state": state,
-                "has_children": has_children,
+                "has_children": True if is_dir else False,
             })
 
-        # Merge local-only entries from Syncthing folder
+        # Merge local-only entries not in global index
         local_dir = syncthing_path / rel if rel else syncthing_path
         if local_dir.is_dir():
             try:
@@ -737,21 +939,15 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                 local_items = []
             for item in local_items:
                 name = item.name
-                if name.startswith(".") or name in seen:
+                if name in seen or (not rel and name in (".stignore", ".stfolder")):
                     continue
                 item_rel = (rel + "/" + name) if rel else name
                 is_dir = item.is_dir()
-                has_children = False
-                if is_dir:
-                    try:
-                        has_children = any(True for _ in item.iterdir())
-                    except PermissionError:
-                        pass
                 wl_status = self.stignore.whitelist_status(item_rel)
                 if wl_status == "direct":
-                    state = "synced"
+                    state = "synced" if folder_synced else "syncing"
                 elif wl_status == "inherited":
-                    state = "inherited"
+                    state = "inherited" if folder_synced else "syncing"
                 else:
                     state = "local"
                 entries.append({
@@ -759,13 +955,47 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                     "rel_path": item_rel,
                     "is_dir": is_dir,
                     "state": state,
-                    "has_children": has_children,
+                    "has_children": True if is_dir else False,
+                })
+
+        # Detect stale whitelist entries (whitelisted but absent from index and disk)
+        for w in self.stignore.get_whitelist():
+            if rel:
+                if not w.startswith(rel + "/"):
+                    continue
+                remainder = w[len(rel) + 1:]
+            else:
+                remainder = w
+            name = remainder.split("/")[0]
+            if name not in seen:
+                seen.add(name)
+                item_rel = (rel + "/" + name) if rel else name
+                is_dir = "/" in remainder or any(
+                    w2.startswith(item_rel + "/") for w2 in self.stignore.get_whitelist()
+                )
+                entries.append({
+                    "name": name,
+                    "rel_path": item_rel,
+                    "is_dir": is_dir,
+                    "state": "stale",
+                    "has_children": is_dir,
                 })
 
         self._send_json({"entries": entries})
 
     def _handle_whitelist(self):
         self._send_json({"whitelist": self.stignore.get_whitelist()})
+
+    def _handle_completion(self):
+        try:
+            data = self.syncthing.completion(self.folder_id)
+            self._send_json({
+                "completion": data.get("completion", 0),
+                "needItems": data.get("needItems", 0),
+                "needBytes": data.get("needBytes", 0),
+            })
+        except Exception as e:
+            self._send_error(502, f"Syncthing API error: {e}")
 
     def _handle_add(self):
         body = self._read_body()
@@ -779,6 +1009,10 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(400, "Path required")
             return
         self.stignore.add(path)
+        try:
+            self.syncthing.trigger_scan(self.folder_id)
+        except Exception:
+            pass
         self._send_json({"ok": True})
 
     def _handle_remove(self):
@@ -793,6 +1027,10 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(400, "Path required")
             return
         self.stignore.remove(path)
+        try:
+            self.syncthing.trigger_scan(self.folder_id)
+        except Exception:
+            pass
         self._send_json({"ok": True})
 
     def _handle_rename(self):
@@ -811,6 +1049,10 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         except FileNotFoundError as e:
             self._send_error(409, str(e))
             return
+        try:
+            self.syncthing.trigger_scan(self.folder_id)
+        except Exception:
+            pass
         self._send_json({"ok": True})
 
 
@@ -820,25 +1062,26 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="NAS Selective Sync UI")
-    parser.add_argument("--nfs", required=True, help="Path to readonly NFS mount")
-    parser.add_argument("--syncthing", required=True, help="Path to local Syncthing folder")
+    parser.add_argument("--api-key", required=True, help="Syncthing REST API key")
+    parser.add_argument("--syncthing-url", default="http://127.0.0.1:8384",
+                        help="Syncthing base URL (default: http://127.0.0.1:8384)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     args = parser.parse_args()
 
-    nfs = pathlib.Path(args.nfs)
-    if not nfs.is_dir():
-        parser.error(f"NFS path not found: {args.nfs}")
+    syncthing = SyncthingClient(args.api_key, args.syncthing_url)
+    try:
+        folders = syncthing.get_folders()
+    except Exception as e:
+        parser.error(f"Cannot reach Syncthing at {args.syncthing_url}: {e}")
+    print(f"Connected to Syncthing — {len(folders)} folder(s) available")
 
-    stignore = StignoreManager(args.syncthing)
-
-    NasUIHandler.nfs_path = nfs
-    NasUIHandler.stignore = stignore
+    NasUIHandler.syncthing = syncthing
+    NasUIHandler.stignore = None
+    NasUIHandler.folder_id = None
 
     server = http.server.HTTPServer((args.bind, args.port), NasUIHandler)
-    print(f"NAS Sync UI → http://{args.bind}:{args.port}")
-    print(f"  NFS:       {nfs}")
-    print(f"  Syncthing: {stignore.syncthing_path}")
+    print(f"peek → http://{args.bind}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

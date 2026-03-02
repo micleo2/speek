@@ -10,7 +10,8 @@
       "Bash(python3:*)",
       "WebFetch(domain:forum.syncthing.net)",
       "WebFetch(domain:man.archlinux.org)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(python:*)"
     ]
   }
 }
