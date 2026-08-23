@@ -67,25 +67,64 @@ body {
 #listing {
     flex: 1;
     overflow-y: auto;
-    padding: 8px 0;
     max-width: 800px;
 }
-a.entry { text-decoration: none; color: inherit; }
-.entry {
-    display: flex;
-    align-items: center;
-    padding: 8px 16px;
-    cursor: pointer;
-    gap: 10px;
-    font-size: 14px;
-    transition: background 0.1s;
+.listing-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: fixed;
 }
-.entry:nth-child(odd) { background: rgba(255,255,255,0.02); }
-.entry:nth-child(even) { background: rgba(255,255,255,0.05); }
-.entry:hover { background: var(--hover); }
-.entry.selected { background: rgba(255,255,255,0.18); outline: 1px solid rgba(255,255,255,0.25); outline-offset: -1px; }
-.entry .icon { width: 20px; text-align: center; flex-shrink: 0; }
-.entry .name { flex: 1; }
+.listing-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--bg);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--fg-dim);
+    padding: 6px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.listing-table thead th a {
+    color: var(--fg-dim);
+    text-decoration: none;
+    cursor: pointer;
+}
+.listing-table thead th a:hover { color: var(--accent); }
+.listing-table thead th a.active { color: var(--accent); }
+.listing-table tbody td {
+    padding: 8px 8px;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.listing-table th:first-child, .listing-table td:first-child { padding-left: 16px; }
+.listing-table th:last-child, .listing-table td:last-child { padding-right: 16px; }
+.listing-table .col-icon { width: 24px; text-align: center; font-size: 13px; }
+.listing-table .col-name { text-align: left; }
+.listing-table .col-size { width: 80px; text-align: right; font-size: 13px; }
+.listing-table .col-mtime { width: 164px; font-size: 12px; }
+.listing-table .col-state { width: 104px; text-align: right; }
+.listing-table .col-size, .listing-table .col-mtime {
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
+}
+tr.entry { cursor: pointer; transition: background 0.1s; }
+tr.entry:nth-child(odd) { background: rgba(255,255,255,0.02); }
+tr.entry:nth-child(even) { background: rgba(255,255,255,0.05); }
+tr.entry:hover { background: var(--hover); }
+tr.entry.selected { background: rgba(255,255,255,0.18); outline: 1px solid rgba(255,255,255,0.25); outline-offset: -1px; }
+a.name-link { text-decoration: none; color: inherit; }
+tr.entry.state-remote .col-name { color: var(--blue); }
+tr.entry.state-synced .col-name { color: var(--green); }
+tr.entry.state-inherited .col-name { color: var(--green); }
+tr.entry.state-local .col-name { color: var(--red); }
+tr.entry.state-stale .col-name { color: var(--green); }
+tr.entry.state-syncing .col-name { color: var(--blue); }
 .entry .badge {
     font-size: 11px;
     padding: 2px 8px;
@@ -94,62 +133,12 @@ a.entry { text-decoration: none; color: inherit; }
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
-.entry.state-remote .name { color: var(--blue); }
-.entry.state-synced .name { color: var(--green); }
-.entry.state-inherited .name { color: var(--green); }
-.entry.state-local .name { color: var(--red); }
-.entry.state-stale .name { color: var(--green); }
-.entry.state-syncing .name { color: var(--blue); }
 .entry.state-remote .badge { background: rgba(78,168,222,0.15); color: var(--blue); }
 .entry.state-synced .badge { background: rgba(87,204,153,0.15); color: var(--green); }
 .entry.state-inherited .badge { background: rgba(87,204,153,0.10); color: var(--green); opacity: 0.7; }
 .entry.state-local .badge { background: rgba(231,111,81,0.15); color: var(--red); }
 .entry.state-stale .badge { background: rgba(87,204,153,0.10); color: var(--green); }
 .entry.state-syncing .badge { background: rgba(78,168,222,0.15); color: var(--blue); }
-.entry .meta {
-    display: flex;
-    gap: 14px;
-    flex-shrink: 0;
-}
-.entry .meta .size {
-    min-width: 64px;
-    text-align: right;
-    font-size: 13px;
-    color: var(--fg-dim);
-    font-variant-numeric: tabular-nums;
-}
-.entry .meta .mtime {
-    min-width: 148px;
-    font-size: 12px;
-    color: var(--fg-dim);
-    font-variant-numeric: tabular-nums;
-}
-.entry.listing-header {
-    cursor: default;
-    background: var(--bg);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg-dim);
-    padding-top: 6px;
-    padding-bottom: 6px;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
-    position: sticky;
-    top: 0;
-    z-index: 5;
-}
-.entry.listing-header .mtime {
-    color: var(--fg-dim);
-    text-decoration: none;
-    cursor: pointer;
-}
-.entry.listing-header .mtime:hover {
-    color: var(--accent);
-}
-.entry.listing-header .mtime.active {
-    color: var(--accent);
-}
 #status {
     background: var(--bg2);
     padding: 8px 16px;
@@ -343,7 +332,14 @@ function showCtx(ev, el) {
 
 function hideCtx() { $ctx.style.display = 'none'; }
 
-document.addEventListener('click', e => { if (!$ctx.contains(e.target)) hideCtx(); });
+document.addEventListener('click', e => {
+    if (!$ctx.contains(e.target)) hideCtx();
+    const row = e.target.closest ? e.target.closest('tr.entry') : null;
+    if (row && row.dataset.href) {
+        e.preventDefault();
+        location.href = row.dataset.href;
+    }
+});
 
 async function doSync() {
     const entry = ctxEntry; hideCtx();
@@ -459,9 +455,10 @@ document.addEventListener('keydown', e => {
         items[idx].classList.add('selected');
         items[idx].scrollIntoView({ block: 'nearest' });
     } else if (e.key === 'l' || e.key === 'Enter') {
-        if (cur && cur.href) {
+        const href = cur && (cur.href || cur.dataset.href);
+        if (href) {
             e.preventDefault();
-            location.href = cur.href;
+            location.href = href;
         }
     } else if (e.key === 's') {
         if (!cur) return;
@@ -606,54 +603,53 @@ def _render_listing(folder_id, folder_label, rel, entries, sort="name"):
         bc += f'<a class="current">{_h(folder_label)}</a>'
     bc += '</div>\n'
 
-    # Listing
-    ls = '<div id="listing">'
-    # Column header with a clickable "Modified" sort toggle
+    # Listing — a real <table> so header and row columns always align
+    ls = '<div id="listing">\n<table class="listing-table">\n'
     base = ('/' + qid + '/' + urllib.parse.quote(rel, safe="/") + '/') if rel else ('/' + qid + '/')
-    next_sort = 'mtime' if sort == 'name' else 'name'
-    active = ' active' if sort == 'mtime' else ''
-    arrow = ' \u2193' if sort == 'mtime' else ''
+    name_href = base + ('?sort=mtime' if sort == 'name' else '?sort=name')
+    mtime_href = base + ('?sort=name' if sort == 'mtime' else '?sort=mtime')
     ls += (
-        '<div class="entry listing-header">'
-        '<span class="icon"></span>'
-        '<span class="name">Name</span>'
-        '<span class="meta">'
-        '<span class="size">Size</span>'
-        f'<a class="mtime{active}" href="{_h(base + "?sort=" + next_sort)}">Modified{arrow}</a>'
-        '</span>'
-        '<span class="badge"></span>'
-        '</div>'
+        '<thead>\n'
+        '<tr class="listing-header">'
+        '<th class="col-icon"></th>'
+        f'<th class="col-name"><a href="{_h(name_href)}" class="{"active" if sort == "name" else ""}">'
+        f'Name{" \u2193" if sort == "name" else ""}</a></th>'
+        '<th class="col-size">Size</th>'
+        f'<th class="col-mtime"><a href="{_h(mtime_href)}" class="{"active" if sort == "mtime" else ""}">'
+        f'Modified{" \u2193" if sort == "mtime" else ""}</a></th>'
+        '<th class="col-state">Status</th>'
+        '</tr>\n'
+        '</thead>\n<tbody>\n'
     )
     if not entries:
-        ls += '<div class="empty-msg">Empty directory</div>'
+        ls += '<tr class="empty-row"><td colspan="5" class="empty-msg">Empty directory</td></tr>\n'
     else:
         for e in entries:
             cls = 'state-' + e["state"]
+            href = ('/' + qid + '/' + urllib.parse.quote(e["rel_path"], safe="/") + '/') if e["is_dir"] else None
             attrs = (
                 f' data-path="{_h(e["rel_path"])}"'
                 f' data-dir="{str(e["is_dir"]).lower()}"'
                 f' data-state="{_h(e["state"])}"'
                 f' data-name="{_h(e["name"])}"'
-                f' oncontextmenu="showCtx(event,this)"'
+                + (f' data-href="{_h(href)}"' if href else '')
+                + ' oncontextmenu="showCtx(event,this)"'
             )
             icon = '&#128193;' if e["is_dir"] else '&#128196;'
-            meta = (
-                f'<span class="meta">'
-                f'<span class="size">{_h(_fmt_size(e.get("size"), e["is_dir"]))}</span>'
-                f'<span class="mtime">{_h(_fmt_time(e.get("mtime")))}</span>'
-                f'</span>'
-            )
-            badge = f'<span class="badge">{_h(e["state"])}</span>'
-            inner = (
-                f'<span class="icon">{icon}</span>'
-                f'<span class="name">{_h(e["name"])}</span>{meta}{badge}'
-            )
-            if e["is_dir"]:
-                href = '/' + qid + '/' + urllib.parse.quote(e["rel_path"], safe="/") + '/'
-                ls += f'<a href="{_h(href)}" class="entry {cls}"{attrs}>{inner}</a>'
+            if href:
+                name_cell = f'<a class="name-link" href="{_h(href)}">{_h(e["name"])}</a>'
             else:
-                ls += f'<div class="entry {cls}"{attrs}>{inner}</div>'
-    ls += '</div>\n'
+                name_cell = _h(e["name"])
+            ls += (
+                f'<tr class="entry {cls}"{attrs}>'
+                f'<td class="col-icon">{icon}</td>'
+                f'<td class="col-name" title="{_h(e["name"])}">{name_cell}</td>'
+                f'<td class="col-size">{_h(_fmt_size(e.get("size"), e["is_dir"]))}</td>'
+                f'<td class="col-mtime">{_h(_fmt_time(e.get("mtime")))}</td>'
+                f'<td class="col-state"><span class="badge">{_h(e["state"])}</span></td>'
+                '</tr>\n'
+            )
+    ls += '</tbody>\n</table>\n</div>\n'
 
     return bc + ls + '<div id="status"></div>'
 
