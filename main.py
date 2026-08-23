@@ -7,10 +7,13 @@ import json
 import argparse
 import shutil
 import os
+import subprocess
+import webbrowser
 import urllib.parse
 import urllib.request
 import urllib.error
 from html import escape as _h
+from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,50 @@ a.entry { text-decoration: none; color: inherit; }
 .entry.state-local .badge { background: rgba(231,111,81,0.15); color: var(--red); }
 .entry.state-stale .badge { background: rgba(87,204,153,0.10); color: var(--green); }
 .entry.state-syncing .badge { background: rgba(78,168,222,0.15); color: var(--blue); }
+.entry .meta {
+    display: flex;
+    gap: 14px;
+    flex-shrink: 0;
+}
+.entry .meta .size {
+    min-width: 64px;
+    text-align: right;
+    font-size: 13px;
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
+}
+.entry .meta .mtime {
+    min-width: 148px;
+    font-size: 12px;
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
+}
+.entry.listing-header {
+    cursor: default;
+    background: var(--bg);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--fg-dim);
+    padding-top: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+}
+.entry.listing-header .mtime {
+    color: var(--fg-dim);
+    text-decoration: none;
+    cursor: pointer;
+}
+.entry.listing-header .mtime:hover {
+    color: var(--accent);
+}
+.entry.listing-header .mtime.active {
+    color: var(--accent);
+}
 #status {
     background: var(--bg2);
     padding: 8px 16px;
@@ -484,6 +531,40 @@ def _render_page(title, body_html, folder_id=None):
     )
 
 
+def _fmt_size(size, is_dir=False):
+    """Human-readable file size, or em-dash for dirs/unknown."""
+    if is_dir or size is None:
+        return "\u2014"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1048576:
+        return f"{size / 1024:.1f} KiB"
+    if size < 1073741824:
+        return f"{size / 1048576:.1f} MiB"
+    return f"{size / 1073741824:.1f} GiB"
+
+
+def _fmt_time(value):
+    """Render an ISO timestamp as 'Aug 14, 2026 1:49pm', or em-dash."""
+    if not value:
+        return "\u2014"
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "\u2014"
+    ampm = "am" if dt.hour < 12 else "pm"
+    hour = dt.hour % 12 or 12
+    return f"{dt.strftime('%b %d, %Y')} {hour}:{dt.minute:02d}{ampm}"
+
+
+def _mtime_sort_key(value):
+    """Negated epoch for newest-first mtime sorting; missing/invalid sorts last."""
+    try:
+        return -datetime.fromisoformat(value).timestamp()
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 def _render_picker(folders):
     """Generate folder picker body HTML."""
     html = '<div id="folder-picker">\n'
@@ -502,7 +583,7 @@ def _render_picker(folders):
     return html
 
 
-def _render_listing(folder_id, folder_label, rel, entries):
+def _render_listing(folder_id, folder_label, rel, entries, sort="name"):
     """Generate breadcrumb + entry list body HTML."""
     qid = urllib.parse.quote(folder_id, safe="")
 
@@ -527,6 +608,22 @@ def _render_listing(folder_id, folder_label, rel, entries):
 
     # Listing
     ls = '<div id="listing">'
+    # Column header with a clickable "Modified" sort toggle
+    base = ('/' + qid + '/' + urllib.parse.quote(rel, safe="/") + '/') if rel else ('/' + qid + '/')
+    next_sort = 'mtime' if sort == 'name' else 'name'
+    active = ' active' if sort == 'mtime' else ''
+    arrow = ' \u2193' if sort == 'mtime' else ''
+    ls += (
+        '<div class="entry listing-header">'
+        '<span class="icon"></span>'
+        '<span class="name">Name</span>'
+        '<span class="meta">'
+        '<span class="size">Size</span>'
+        f'<a class="mtime{active}" href="{_h(base + "?sort=" + next_sort)}">Modified{arrow}</a>'
+        '</span>'
+        '<span class="badge"></span>'
+        '</div>'
+    )
     if not entries:
         ls += '<div class="empty-msg">Empty directory</div>'
     else:
@@ -540,10 +637,16 @@ def _render_listing(folder_id, folder_label, rel, entries):
                 f' oncontextmenu="showCtx(event,this)"'
             )
             icon = '&#128193;' if e["is_dir"] else '&#128196;'
+            meta = (
+                f'<span class="meta">'
+                f'<span class="size">{_h(_fmt_size(e.get("size"), e["is_dir"]))}</span>'
+                f'<span class="mtime">{_h(_fmt_time(e.get("mtime")))}</span>'
+                f'</span>'
+            )
             badge = f'<span class="badge">{_h(e["state"])}</span>'
             inner = (
                 f'<span class="icon">{icon}</span>'
-                f'<span class="name">{_h(e["name"])}</span>{badge}'
+                f'<span class="name">{_h(e["name"])}</span>{meta}{badge}'
             )
             if e["is_dir"]:
                 href = '/' + qid + '/' + urllib.parse.quote(e["rel_path"], safe="/") + '/'
@@ -817,7 +920,7 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
         stignore = StignoreManager(self.syncthing, folder_id, folder["path"])
         return folder, stignore
 
-    def _build_entries(self, folder_id, stignore, rel):
+    def _build_entries(self, folder_id, stignore, rel, sort="name"):
         """Build the entry list for a directory listing."""
         syncthing_path = stignore.local_path
         whitelist = stignore.get_whitelist()
@@ -870,6 +973,8 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                 "rel_path": item_rel,
                 "is_dir": is_dir,
                 "state": state,
+                "size": item.get("size"),
+                "mtime": item.get("modTime"),
             })
 
         # Merge local-only entries not in global index
@@ -886,6 +991,13 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 item_rel = (rel + "/" + name) if rel else name
                 is_dir = item.is_dir()
+                try:
+                    st = item.stat()
+                    size = st.st_size
+                    mtime = datetime.fromtimestamp(st.st_mtime).astimezone().isoformat()
+                except OSError:
+                    size = None
+                    mtime = None
                 wl_status = stignore.whitelist_status(item_rel)
                 if wl_status == "direct":
                     state = "synced" if folder_synced else "syncing"
@@ -901,6 +1013,8 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                     "rel_path": item_rel,
                     "is_dir": is_dir,
                     "state": state,
+                    "size": size,
+                    "mtime": mtime,
                 })
 
         # Detect stale whitelist entries
@@ -923,12 +1037,17 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
                     "rel_path": item_rel,
                     "is_dir": is_dir,
                     "state": "stale",
+                    "size": None,
+                    "mtime": None,
                 })
 
         # Sort: remote first, then synced/inherited/syncing, then local, then stale;
         # within each group dirs-first then alphabetical
         state_order = {"remote": 0, "syncing": 1, "synced": 2, "inherited": 3, "local": 4, "stale": 5}
-        entries.sort(key=lambda e: (state_order.get(e["state"], 9), not e["is_dir"], e["name"].lower()))
+        if sort == "mtime":
+            entries.sort(key=lambda e: (state_order.get(e["state"], 9), not e["is_dir"], _mtime_sort_key(e.get("mtime"))))
+        else:
+            entries.sort(key=lambda e: (state_order.get(e["state"], 9), not e["is_dir"], e["name"].lower()))
         return entries
 
     # -- Routing -------------------------------------------------------------
@@ -982,13 +1101,17 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            entries = self._build_entries(folder_id, stignore, rel)
+            qs = urllib.parse.parse_qs(parsed.query)
+            sort = qs.get("sort", ["name"])[0]
+            if sort not in ("name", "mtime"):
+                sort = "name"
+            entries = self._build_entries(folder_id, stignore, rel, sort)
         except Exception as e:
             self._send_error(502, f"Syncthing API error: {e}")
             return
 
         folder_label = folder.get("label") or folder["id"]
-        body = _render_listing(folder_id, folder_label, rel, entries)
+        body = _render_listing(folder_id, folder_label, rel, entries, sort)
         self._send_html(_render_page(f"peek({folder_label})", body, folder_id=folder_id))
 
     def do_POST(self):
@@ -1108,12 +1231,22 @@ class NasUIHandler(http.server.BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="NAS Selective Sync UI")
-    parser.add_argument("--api-key", required=True, help="Syncthing REST API key")
+    parser.add_argument("--api-key", default=None,
+                        help="Syncthing REST API key (default: from `syncthing cli config gui apikey get`)")
     parser.add_argument("--syncthing-url", default="http://127.0.0.1:8384",
                         help="Syncthing base URL (default: http://127.0.0.1:8384)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--no-open", action="store_true", help="Don't open the browser automatically")
     args = parser.parse_args()
+
+    if args.api_key is None:
+        print("warning: no api key given, so defaulting to `syncthing cli config gui apikey get`")
+        result = subprocess.run(
+            ["syncthing", "cli", "config", "gui", "apikey", "get"],
+            capture_output=True, text=True, check=True
+        )
+        args.api_key = result.stdout.strip()
 
     syncthing = SyncthingClient(args.api_key, args.syncthing_url)
     try:
@@ -1126,6 +1259,8 @@ def main():
 
     server = http.server.ThreadingHTTPServer((args.bind, args.port), NasUIHandler)
     print(f"peek \u2192 http://{args.bind}:{args.port}")
+    if not args.no_open:
+        webbrowser.open(f"http://{args.bind}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
