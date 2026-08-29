@@ -1,0 +1,13 @@
+[lint]
+ignore = [
+    # Blind `except Exception` is deliberate around Syncthing I/O: urllib
+    # raises many unrelated types and the handlers degrade gracefully.
+    "BLE001",
+    "S110",
+    # Explicit guard-clause returns read better than `return not (...)`.
+    "SIM103",
+]
+
+[format]
+# Don't churn quotes in the HTML-building strings.
+quote-style = "preserve"
